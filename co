@@ -1,0 +1,156 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+usage() {
+    echo "co - cp wrapper with rsync-over-ssh for remote mounts"
+    echo "Usage: co [cp options] source dest"
+    echo ""
+    echo "Detects Samba mounts and uses rsync over ssh when appropriate."
+    exit 1
+}
+
+# Get the mount point and host for a given path
+get_mount_info() {
+    local path="$1"
+    local mount_point mount_source
+
+    # Get the mount point for this path
+    mount_point=$(df "$path" 2>/dev/null | tail -1 | awk '{print $NF}')
+    
+    if [[ -z "$mount_point" ]]; then
+        echo ""
+        return
+    fi
+
+    # Check if it's a network mount (cifs/smb)
+    mount_source=$(df -t cifs,smbfs "$path" 2>/dev/null | tail -1 | awk '{print $1}' || true)
+    
+    if [[ -z "$mount_source" ]]; then
+        echo ""
+        return
+    fi
+
+    # Extract hostname from mount source (format: //hostname/share)
+    local host=$(echo "$mount_source" | sed -E 's|^//([^/]+)/.*|\1|')
+    
+    echo "$host"
+}
+
+# Check if a path is on a remote mount
+is_remote_mount() {
+    local path="$1"
+    local host=$(get_mount_info "$path")
+    [[ -n "$host" ]]
+}
+
+# Get hostname for a path (empty if local)
+get_host() {
+    local path="$1"
+    get_mount_info "$path"
+}
+
+
+# Convert absolute path to a form that works on remote
+# Assumes path structure is the same locally and remotely
+remote_path() {
+    echo "$1"
+}
+main() {
+    local -a args=("$@")
+    
+    if (( ${#args[@]} < 2 )); then
+        usage
+    fi
+    
+    # Parse arguments - simpler approach without mapfile
+    local -a cp_options=()
+    local source="" dest=""
+    local i
+    
+    for ((i=0; i<${#args[@]}; i++)); do
+        local arg="${args[$i]}"
+        
+        # Handle long options with = (e.g., --backup=simple)
+        if [[ "$arg" =~ ^--[^=]+=.* ]]; then
+            cp_options+=("$arg")
+            continue
+        fi
+        
+        # Handle option flags (single dash or double dash)
+        if [[ "$arg" =~ ^-[a-zA-Z]+$ ]] || [[ "$arg" =~ ^--[a-zA-Z-]+$ ]]; then
+            cp_options+=("$arg")
+            continue
+        fi
+        
+        # Handle option that takes a separate argument (-X value)
+        if [[ "$arg" =~ ^-[a-zA-Z]$ ]] && (( i + 1 < ${#args[@]} )); then
+            local next_arg="${args[$((i+1))]}"
+            if [[ ! "$next_arg" =~ ^- ]]; then
+                cp_options+=("$arg" "$next_arg")
+                ((i++))
+                continue
+            fi
+        fi
+        
+        # Non-option arguments: source and dest
+        if [[ -z "$source" ]]; then
+            source="$arg"
+        elif [[ -z "$dest" ]]; then
+            dest="$arg"
+        fi
+    done
+    
+    if [[ -z "$source" ]] || [[ -z "$dest" ]]; then
+        usage
+    fi
+    
+    # Check if source or dest are remote
+    local source_host dest_host
+    source_host=$(get_host "$source")
+    dest_host=$(get_host "$dest")
+    
+    # If neither are remote, just use regular cp
+    if [[ -z "$source_host" ]] && [[ -z "$dest_host" ]]; then
+        if (( ${#cp_options[@]} > 0 )); then
+            cp "${cp_options[@]}" "$source" "$dest"
+        else
+            cp "$source" "$dest"
+        fi
+        return
+    fi
+    
+    # If source is remote and dest is local
+    if [[ -n "$source_host" ]] && [[ -z "$dest_host" ]]; then
+        local remote_src=$(remote_path "$source")
+        if (( ${#cp_options[@]} > 0 )); then
+            rsync -avz --delete "${cp_options[@]}" "$source_host:$remote_src" "$dest"
+        else
+            rsync -avz --delete "$source_host:$remote_src" "$dest"
+        fi
+        return
+    fi
+    
+    # If source is local and dest is remote
+    if [[ -z "$source_host" ]] && [[ -n "$dest_host" ]]; then
+        local remote_dst=$(remote_path "$dest")
+        if (( ${#cp_options[@]} > 0 )); then
+            rsync -avz --delete "${cp_options[@]}" "$source" "$dest_host:$remote_dst"
+        else
+            rsync -avz --delete "$source" "$dest_host:$remote_dst"
+        fi
+        return
+    fi
+    
+    # Both are remote - not supported in this mode, fall back to cp
+    if [[ -n "$source_host" ]] && [[ -n "$dest_host" ]]; then
+        if (( ${#cp_options[@]} > 0 )); then
+            cp "${cp_options[@]}" "$source" "$dest"
+        else
+            cp "$source" "$dest"
+        fi
+        return
+    fi
+}
+
+main "$@"
